@@ -434,8 +434,7 @@ func (b *OpenAPIBuilder) createSchemaFromType(t reflect.Type, validateTag string
 	case reflect.Bool:
 		schema.Type = "boolean"
 	case reflect.Slice, reflect.Array:
-		if strings.Contains(validateTag, "uuid") {
-			// Google UUID's are represented as slices of ints
+		if t.String() == "uuid.UUID" {
 			schema.Type = "string"
 			schema.Format = "uuid"
 		} else {
