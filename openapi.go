@@ -434,8 +434,14 @@ func (b *OpenAPIBuilder) createSchemaFromType(t reflect.Type, validateTag string
 	case reflect.Bool:
 		schema.Type = "boolean"
 	case reflect.Slice, reflect.Array:
-		schema.Type = "array"
-		schema.Items = b.createSchemaFromType(t.Elem(), "")
+		if strings.Contains(validateTag, "uuid") {
+			// Google UUID's are represented as slices of ints
+			schema.Type = "string"
+			schema.Format = "uuid"
+		} else {
+			schema.Type = "array"
+			schema.Items = b.createSchemaFromType(t.Elem(), "")
+		}
 	case reflect.Struct:
 		// Handle time.Time specially
 		if t.String() == "time.Time" {
