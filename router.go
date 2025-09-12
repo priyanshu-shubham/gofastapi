@@ -68,6 +68,7 @@ func (r *Router) RegisterDependency(name string, dep interface{}, schemeTypes ..
 	return nil
 }
 
+// RegisterValidationRule adds a new validation rule to the underlying validator.
 func (r *Router) RegisterValidationRule(tag string, fn validator.Func) error {
 	return addValidationRule(tag, fn)
 }
