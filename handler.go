@@ -26,6 +26,74 @@ type CompiledHandler struct {
 	hasJSONBody  bool
 }
 
+// extractHandlerMetadata extracts dependencies and JSON body info from request type
+func extractHandlerMetadata(reqType reflect.Type) (map[int]string, bool) {
+	dependencies := make(map[int]string)
+	hasJSONBody := false
+
+	for i := 0; i < reqType.NumField(); i++ {
+		field := reqType.Field(i)
+
+		if depTag := field.Tag.Get("dep"); depTag != "" {
+			dependencies[i] = strings.Split(depTag, ".")[0]
+		}
+
+		if jsonTag := field.Tag.Get("json"); jsonTag != "" && jsonTag != "-" {
+			hasJSONBody = true
+		}
+	}
+
+	return dependencies, hasJSONBody
+}
+
+// getPathVars extracts path variables from request
+func getPathVars(r *http.Request) map[string]string {
+	return mux.Vars(r)
+}
+
+// extractFields handles field extraction logic (shared between regular and SSE handlers)
+func extractFields(ctx context.Context, reqValue reflect.Value, extractors map[int]FieldExtractor, dependencies map[int]string, r *http.Request, vars map[string]string, body []byte, depResolver *DependencyResolver, resolved *ResolvedDependencies) error {
+	for fieldIdx, extractor := range extractors {
+		var value interface{}
+		var err error
+
+		// Handle dependency extractors
+		if depExt, ok := extractor.(*DependencyExtractor); ok {
+			// Resolve the dependency
+			depResult, err := depResolver.Resolve(ctx, depExt.depName, r, vars, body, resolved)
+			if err != nil {
+				return err
+			}
+
+			// Extract nested field if needed
+			if len(depExt.fieldPath) > 1 {
+				value = extractNestedField(depResult, depExt.fieldPath[1:])
+			} else {
+				value = depResult
+			}
+		} else {
+			value, err = extractor.Extract(r, vars, body)
+			if err != nil {
+				return err
+			}
+		}
+
+		if value != nil {
+			field := reqValue.Field(fieldIdx)
+			fieldValue := reflect.ValueOf(value)
+
+			// Handle type conversion
+			if fieldValue.Type().ConvertibleTo(field.Type()) {
+				field.Set(fieldValue.Convert(field.Type()))
+			} else {
+				field.Set(fieldValue)
+			}
+		}
+	}
+
+	return nil
+}
+
 // compileHandler pre-compiles a handler function for efficient execution
 func compileHandler(handler interface{}) (*CompiledHandler, error) {
 	handlerType := reflect.TypeOf(handler)
@@ -58,21 +126,8 @@ func compileHandler(handler interface{}) (*CompiledHandler, error) {
 		return nil, err
 	}
 
-	// Check for dependencies and JSON body
-	dependencies := make(map[int]string)
-	hasJSONBody := false
-
-	for i := 0; i < reqType.NumField(); i++ {
-		field := reqType.Field(i)
-
-		if depTag := field.Tag.Get("dep"); depTag != "" {
-			dependencies[i] = strings.Split(depTag, ".")[0]
-		}
-
-		if jsonTag := field.Tag.Get("json"); jsonTag != "" && jsonTag != "-" {
-			hasJSONBody = true
-		}
-	}
+	// Use shared helper
+	dependencies, hasJSONBody := extractHandlerMetadata(reqType)
 
 	return &CompiledHandler{
 		handlerFunc:  handlerValue,
@@ -153,7 +208,7 @@ func (ch *CompiledHandler) Execute(ctx context.Context, w http.ResponseWriter, r
 	}
 
 	// Extract path variables
-	vars := mux.Vars(r)
+	vars := getPathVars(r)
 
 	// Create request struct
 	reqValue := reflect.New(ch.reqType).Elem()
@@ -163,45 +218,11 @@ func (ch *CompiledHandler) Execute(ctx context.Context, w http.ResponseWriter, r
 		values: make(map[string]interface{}),
 	}
 
-	// Extract all fields
-	for fieldIdx, extractor := range ch.extractors {
-		var value interface{}
-
-		// Handle dependency extractors
-		if depExt, ok := extractor.(*DependencyExtractor); ok {
-			// Resolve the dependency
-			depResult, err := depResolver.Resolve(ctx, depExt.depName, r, vars, body, resolved)
-			if err != nil {
-				// Pass the error directly to preserve its type
-				errorHandler(w, r, err)
-				return
-			}
-
-			// Extract nested field if needed
-			if len(depExt.fieldPath) > 1 {
-				value = extractNestedField(depResult, depExt.fieldPath[1:])
-			} else {
-				value = depResult
-			}
-		} else {
-			value, err = extractor.Extract(r, vars, body)
-			if err != nil {
-				errorHandler(w, r, err)
-				return
-			}
-		}
-
-		if value != nil {
-			field := reqValue.Field(fieldIdx)
-			fieldValue := reflect.ValueOf(value)
-
-			// Handle type conversion
-			if fieldValue.Type().ConvertibleTo(field.Type()) {
-				field.Set(fieldValue.Convert(field.Type()))
-			} else {
-				field.Set(fieldValue)
-			}
-		}
+	// Extract all fields using shared logic
+	err = extractFields(ctx, reqValue, ch.extractors, ch.dependencies, r, vars, body, depResolver, resolved)
+	if err != nil {
+		errorHandler(w, r, err)
+		return
 	}
 
 	// Validate the request
@@ -226,7 +247,6 @@ func (ch *CompiledHandler) Execute(ctx context.Context, w http.ResponseWriter, r
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(results[0].Interface()); err != nil {
-		// Log error but response is already partially written
 		fmt.Printf("Failed to encode response: %v\n", err)
 	}
 }

@@ -178,6 +178,59 @@ func (r *Router) Group(prefix string) *SubRouter {
 	}
 }
 
+// SSEGET registers an SSE GET route
+func (r *Router) SSEGET(path string, handler interface{}) error {
+	return r.registerSSERoute(http.MethodGet, path, handler)
+}
+
+// SSEPOST registers an SSE POST route
+func (r *Router) SSEPOST(path string, handler interface{}) error {
+	return r.registerSSERoute(http.MethodPost, path, handler)
+}
+
+// registerSSERoute compiles and registers an SSE route handler
+func (r *Router) registerSSERoute(method, path string, handler interface{}) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Compile the SSE handler
+	compiled, err := compileSSEHandler(handler)
+	if err != nil {
+		return fmt.Errorf("failed to compile SSE handler for %s %s: %w", method, path, err)
+	}
+
+	// Extract dependencies
+	var dependencies []string
+	for _, depName := range compiled.dependencies {
+		dependencies = append(dependencies, depName)
+	}
+
+	// Store metadata (reuse existing routeInfo structure)
+	routeKey := fmt.Sprintf("%s:%s", method, path)
+	r.routeMetadata[routeKey] = &routeInfo{
+		method:       method,
+		path:         path,
+		handler:      nil, // SSE handlers don't use regular CompiledHandler
+		dependencies: dependencies,
+	}
+
+	// Add to OpenAPI spec
+	r.openAPIBuilder.AddSSERoute(method, path, compiled, dependencies)
+
+	// Register with mux
+	r.mux.HandleFunc(path, func(w http.ResponseWriter, req *http.Request) {
+		r.mu.RLock()
+		errorHandler := r.errorHandler
+		r.mu.RUnlock()
+
+		// Execute the compiled SSE handler
+		ctx := req.Context()
+		compiled.Execute(ctx, w, req, r.depResolver, errorHandler)
+	}).Methods(method)
+
+	return nil
+}
+
 // SubRouter represents a group of routes with a common prefix
 type SubRouter struct {
 	router *Router
@@ -218,6 +271,16 @@ func (sr *SubRouter) DELETE(path string, handler interface{}) error {
 // Use adds middleware to the subrouter
 func (sr *SubRouter) Use(middleware ...mux.MiddlewareFunc) {
 	sr.mux.Use(middleware...)
+}
+
+func (sr *SubRouter) SSEGET(path string, handler interface{}) error {
+	fullPath := sr.prefix + path
+	return sr.router.registerSSERoute(http.MethodGet, fullPath, handler)
+}
+
+func (sr *SubRouter) SSEPOST(path string, handler interface{}) error {
+	fullPath := sr.prefix + path
+	return sr.router.registerSSERoute(http.MethodPost, fullPath, handler)
 }
 
 // GenerateOpenAPISpec returns the OpenAPI specification

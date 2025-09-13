@@ -717,3 +717,220 @@ func parseValue(s string, t reflect.Type) interface{} {
 		return s
 	}
 }
+
+// AddSSERoute adds an SSE route to the OpenAPI spec
+func (b *OpenAPIBuilder) AddSSERoute(method, path string, handler *SSECompiledHandler, dependencies []string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// Convert gorilla mux path to OpenAPI path
+	openAPIPath := convertToOpenAPIPath(path)
+
+	// Get or create path item
+	pathItem, exists := b.spec.Paths[openAPIPath]
+	if !exists {
+		pathItem = &PathItem{}
+		b.spec.Paths[openAPIPath] = pathItem
+	}
+
+	// Create operation for SSE
+	operation := b.createSSEOperation(method, openAPIPath, handler, dependencies)
+
+	// Set operation on path item
+	switch strings.ToUpper(method) {
+	case http.MethodGet:
+		pathItem.Get = operation
+	case http.MethodPost:
+		pathItem.Post = operation
+	}
+}
+
+// createSSEOperation creates an OpenAPI operation for SSE endpoints
+func (b *OpenAPIBuilder) createSSEOperation(method, path string, handler *SSECompiledHandler, dependencies []string) *Operation {
+	operation := &Operation{
+		OperationID: generateOperationID(method, path) + "Stream",
+		Parameters:  []Parameter{},
+		Responses:   make(map[string]interface{}),
+	}
+
+	// Add security requirements if there are dependencies
+	if len(dependencies) > 0 {
+		operation.Security = []map[string][]string{}
+		for _, dep := range dependencies {
+			operation.Security = append(operation.Security, map[string][]string{
+				dep: {},
+			})
+		}
+	}
+
+	// Extract parameters from request type (same logic as regular routes)
+	var requestBodySchema *Schema
+	var requestBodyRequired []string
+
+	for i := 0; i < handler.reqType.NumField(); i++ {
+		field := handler.reqType.Field(i)
+
+		// Skip unexported fields and dependencies
+		if field.PkgPath != "" || field.Tag.Get("dep") != "" {
+			continue
+		}
+
+		// Handle parameters (same as regular routes)
+		if pathTag := field.Tag.Get("path"); pathTag != "" {
+			validateTag := field.Tag.Get("validate")
+			description := field.Tag.Get("description")
+			example := field.Tag.Get("example")
+
+			param := Parameter{
+				Name:        pathTag,
+				In:          "path",
+				Required:    true,
+				Description: description,
+				Schema:      b.createSchemaFromType(field.Type, validateTag),
+			}
+			if example != "" {
+				param.Example = example
+			}
+			operation.Parameters = append(operation.Parameters, param)
+		} else if queryTag := field.Tag.Get("query"); queryTag != "" {
+			validateTag := field.Tag.Get("validate")
+			isRequired := strings.Contains(validateTag, "required")
+			description := field.Tag.Get("description")
+			example := field.Tag.Get("example")
+			defaultValue := field.Tag.Get("default")
+
+			schema := b.createSchemaFromType(field.Type, validateTag)
+			if defaultValue != "" {
+				schema.Default = parseValue(defaultValue, field.Type)
+			}
+
+			param := Parameter{
+				Name:        queryTag,
+				In:          "query",
+				Required:    isRequired,
+				Description: description,
+				Schema:      schema,
+			}
+			if example != "" {
+				param.Example = example
+			}
+			operation.Parameters = append(operation.Parameters, param)
+		} else if headerTag := field.Tag.Get("header"); headerTag != "" {
+			validateTag := field.Tag.Get("validate")
+			isRequired := strings.Contains(validateTag, "required")
+			description := field.Tag.Get("description")
+			example := field.Tag.Get("example")
+
+			param := Parameter{
+				Name:        headerTag,
+				In:          "header",
+				Required:    isRequired,
+				Description: description,
+				Schema:      b.createSchemaFromType(field.Type, validateTag),
+			}
+			if example != "" {
+				param.Example = example
+			}
+			operation.Parameters = append(operation.Parameters, param)
+		} else if jsonTag := field.Tag.Get("json"); jsonTag != "" && jsonTag != "-" {
+			// Handle request body for POST SSE endpoints
+			if requestBodySchema == nil {
+				requestBodySchema = &Schema{
+					Type:       "object",
+					Properties: make(map[string]*Schema),
+					Required:   []string{},
+				}
+			}
+
+			validateTag := field.Tag.Get("validate")
+			isRequired := strings.Contains(validateTag, "required")
+			description := field.Tag.Get("description")
+			example := field.Tag.Get("example")
+			defaultValue := field.Tag.Get("default")
+
+			fieldName := strings.Split(jsonTag, ",")[0]
+			fieldSchema := b.createSchemaFromType(field.Type, validateTag)
+			fieldSchema.Description = description
+			if example != "" {
+				fieldSchema.Example = example
+			}
+			if defaultValue != "" {
+				fieldSchema.Default = parseValue(defaultValue, field.Type)
+			}
+
+			requestBodySchema.Properties[fieldName] = fieldSchema
+			if isRequired {
+				requestBodyRequired = append(requestBodyRequired, fieldName)
+			}
+		}
+	}
+
+	// Add request body for POST if present
+	if requestBodySchema != nil && strings.ToUpper(method) == http.MethodPost {
+		requestBodySchema.Required = requestBodyRequired
+		operation.RequestBody = &RequestBody{
+			Required: len(requestBodyRequired) > 0,
+			Content: map[string]MediaType{
+				"application/json": {
+					Schema: requestBodySchema,
+				},
+			},
+		}
+	}
+
+	// Create event data schema reference
+	eventDataSchema := b.getOrCreateSchema(handler.respType)
+	sseEventSchemaName := handler.respType.Name() + "SSEEvent"
+	sseEventSchema := &Schema{
+		Type:        "object",
+		Description: "Server-Sent Event structure",
+		Properties: map[string]*Schema{
+			"event": {
+				Type:        "string",
+				Description: "Event type identifier",
+				Example:     "update",
+			},
+			"id": {
+				Type:        "string",
+				Description: "Unique event identifier (optional)",
+				Example:     "evt-123",
+			},
+			"retry": {
+				Type:        "integer",
+				Description: "Reconnection time in milliseconds (optional)",
+				Example:     5000,
+			},
+			"data": eventDataSchema,
+		},
+		Required: []string{"data"},
+	}
+
+	b.spec.Components.Schemas[sseEventSchemaName] = sseEventSchema
+
+	// Create the complete Response structure at once
+	sseResponse := &Response{
+		Description: fmt.Sprintf("Server-Sent Events stream of %s events", handler.respType.Name()),
+		Content: map[string]MediaType{
+			"text/event-stream": {
+				Schema: &Schema{
+					Type:        "string",
+					Description: fmt.Sprintf("Server-Sent Events stream. Each event follows the SSE format with JSON data conforming to the %s schema.", handler.respType.Name()),
+				},
+			},
+		},
+	}
+
+	sseResponse.Content["application/json"] = MediaType{
+		Schema: &Schema{
+			Ref: "#/components/schemas/" + sseEventSchemaName,
+		},
+	}
+
+	// Assign the complete response
+	operation.Responses["200"] = sseResponse
+
+	// Add common error responses
+	b.addErrorResponses(operation)
+
+	return operation
+}
