@@ -12,10 +12,10 @@ import (
 
 // EventData represents a Server-Sent Event
 type EventData[T any] struct {
-	Event string `json:"-"`    // SSE event field (optional)
-	Data  T      `json:"data"` // The actual data payload (required)
-	ID    string `json:"-"`    // SSE id field (optional)
-	Retry int    `json:"-"`    // SSE retry field in milliseconds (optional)
+	Event string `json:"event,omitempty"` // The SSE event type (optional)
+	Data  T      `json:"data"`            // The actual data payload (required)
+	ID    string `json:"id,omitempty"`    // SSE id field (optional)
+	Retry int    `json:"retry,omitempty"` // SSE retry field in milliseconds (optional)
 }
 
 // SSECompiledHandler represents a pre-compiled SSE handler
