@@ -437,6 +437,9 @@ func (b *OpenAPIBuilder) createSchemaFromType(t reflect.Type, validateTag string
 		if t.String() == "uuid.UUID" {
 			schema.Type = "string"
 			schema.Format = "uuid"
+		} else if t.String() == "[]byte" {
+			schema.Type = "string"
+			schema.Format = "byte"
 		} else {
 			schema.Type = "array"
 			schema.Items = b.createSchemaFromType(t.Elem(), "")
